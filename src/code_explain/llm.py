@@ -39,17 +39,27 @@ class LLMClient:
         keep_alive: str | None = None,
     ) -> Iterator[str]:
         full = [{"role": "system", "content": system}] + list(messages)
-        stream = self._client.chat(
-            model=self.cfg.llm_model,
-            messages=full,
-            stream=True,
-            options=self._options(),
-            keep_alive=keep_alive or self.cfg.keep_alive,
-        )
-        for chunk in stream:
-            content = _extract_content(chunk)
-            if content:
-                yield content
+        try:
+            stream = self._client.chat(
+                model=self.cfg.llm_model,
+                messages=full,
+                stream=True,
+                options=self._options(),
+                keep_alive=keep_alive or self.cfg.keep_alive,
+            )
+        except Exception as exc:
+            from code_explain.errors import raise_ollama_or_reraise
+
+            raise_ollama_or_reraise(exc, model=self.cfg.llm_model, what="stream a chat completion from Ollama")
+        try:
+            for chunk in stream:
+                content = _extract_content(chunk)
+                if content:
+                    yield content
+        except Exception as exc:
+            from code_explain.errors import raise_ollama_or_reraise
+
+            raise_ollama_or_reraise(exc, model=self.cfg.llm_model, what="read a chat stream from Ollama")
 
     def chat(
         self,
@@ -59,6 +69,58 @@ class LLMClient:
         keep_alive: str | None = None,
     ) -> str:
         return "".join(self.chat_stream(system, messages, keep_alive=keep_alive))
+
+    def chat_turn(
+        self,
+        system: str,
+        messages: list[dict],
+        *,
+        tools: list | None = None,
+        keep_alive: str | None = None,
+        format: str | None = None,
+    ):
+        """Non-streaming chat turn that may invoke tools.
+
+        Returns the raw ``ChatResponse`` so the caller can read
+        ``message.tool_calls`` and ``message.content`` directly. Streaming is
+        disabled because Ollama does not reliably assemble tool-call JSON across
+        stream chunks; use :meth:`chat_stream` only for the final prose answer.
+
+        ``format`` is passed through to Ollama (e.g. ``"json"``) to force a
+        structured response; used by the LLM reranker.
+        """
+        full = [{"role": "system", "content": system}] + list(messages)
+        try:
+            return self._client.chat(
+                model=self.cfg.llm_model,
+                messages=full,
+                tools=tools,
+                stream=False,
+                options=self._options(),
+                keep_alive=keep_alive or self.cfg.keep_alive,
+                format=format,
+            )
+        except Exception as exc:
+            from code_explain.errors import raise_ollama_or_reraise
+
+            raise_ollama_or_reraise(exc, model=self.cfg.llm_model, what="send a chat turn to Ollama")
+
+    def supports_tools(self) -> bool:
+        """True if the configured model declares the ``tools`` capability.
+
+        Cached on the instance. Any error (Ollama not running, model missing)
+        returns False so callers can fail with a clear message rather than crash.
+        """
+        if hasattr(self, "_supports_tools_cache"):
+            return self._supports_tools_cache  # type: ignore[no-any-return]
+        try:
+            resp = self._client.show(self.cfg.llm_model)
+            caps = getattr(resp, "capabilities", None)
+            ok = bool(caps) and "tools" in caps
+        except Exception:
+            ok = False
+        self._supports_tools_cache = ok
+        return ok
 
 
 def _extract_content(chunk) -> str:

@@ -77,12 +77,19 @@ MAX_FILE_BYTES = 1_500_000  # skip files larger than ~1.5MB
 def discover_files(repo_path: Path) -> list[Path]:
     """Return repo-relative-ish Paths of text files to index.
 
-    Returns absolute paths sorted by str. Respects .gitignore when possible.
+    Returns absolute paths sorted by str. Respects ``.gitignore`` when possible,
+    and always respects a ``.codeexplainignore`` file at the repo root (git's
+    ``--exclude-standard`` honors ``.gitignore`` but not ``.codeexplainignore``,
+    so we filter the git listing through it explicitly).
     """
     repo_path = repo_path.resolve()
+    codeexplain_spec = _load_codeexplain_ignore(repo_path)
     rels = _git_ls_files(repo_path)
     if rels is None:
-        rels = _walk(repo_path)
+        rels = _walk(repo_path)  # walk already applies .gitignore + .codeexplainignore
+    elif codeexplain_spec is not None:
+        # git respects .gitignore but not .codeexplainignore → filter here.
+        rels = [r for r in rels if not codeexplain_spec.match_file(r)]
     files = [(repo_path / r) for r in rels]
     files = [f for f in files if _is_indexable(f)]
     return sorted(files, key=lambda p: str(p))
@@ -175,16 +182,37 @@ def _iter_filtered(repo_path: Path, ignore_specs):
 
 
 def _load_gitignores(repo_path: Path):
+    """Load ``.gitignore`` and ``.codeexplainignore`` (if present) as pathspecs.
+
+    Used by the walk fallback, which honors both. Git already respects
+    ``.gitignore`` via ``--exclude-standard``; ``.codeexplainignore`` is applied
+    to the git listing separately in :func:`discover_files`.
+    """
     if not _HAS_PATHSPEC:
         return []
-    gi = repo_path / ".gitignore"
-    if not gi.exists():
-        return []
+    specs = []
+    for name in (".gitignore", ".codeexplainignore"):
+        f = repo_path / name
+        if not f.exists():
+            continue
+        try:
+            specs.append(pathspec.PathSpec.from_lines("gitignore", f.read_text().splitlines()))
+        except OSError:
+            continue
+    return specs
+
+
+def _load_codeexplain_ignore(repo_path: Path):
+    """Load just the ``.codeexplainignore`` spec, or ``None`` if absent/unsuppported."""
+    if not _HAS_PATHSPEC:
+        return None
+    f = repo_path / ".codeexplainignore"
+    if not f.exists():
+        return None
     try:
-        lines = gi.read_text().splitlines()
+        return pathspec.PathSpec.from_lines("gitignore", f.read_text().splitlines())
     except OSError:
-        return []
-    return [pathspec.PathSpec.from_lines("gitignore", lines)]
+        return None
 
 
 def _ignored(rel_path: str, specs) -> bool:

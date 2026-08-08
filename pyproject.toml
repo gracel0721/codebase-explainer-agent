@@ -4,21 +4,23 @@ build-backend = "hatchling.build"
 
 [project]
 name = "code-explain"
-version = "0.1.0"
+version = "0.2.0"
 description = "A local, RAG-powered CLI that indexes a codebase and answers questions about it."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [{ name = "Grace Leverett" }]
-keywords = ["rag", "codebase", "ollama", "cli", "code-search"]
+keywords = ["rag", "codebase", "ollama", "cli", "code-search", "agent"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Documentation",
 ]
 
@@ -38,6 +40,10 @@ dependencies = [
 macos-system-python = [
     "pysqlite3-binary>=0.5",
 ]
+# Alternative vector backend (LanceDB). sqlite-vec remains the default.
+lancedb = [
+    "lancedb>=0.10",
+]
 dev = [
     "pytest>=8.0",
     "pytest-mock>=3.12",
@@ -48,9 +54,16 @@ code-explain = "code_explain.cli:app"
 
 [project.urls]
 Homepage = "https://github.com/gvleverett/codebase-explainer-agent"
+Repository = "https://github.com/gvleverett/codebase-explainer-agent"
+Issues = "https://github.com/gvleverett/codebase-explainer-agent/issues"
+Changelog = "https://github.com/gvleverett/codebase-explainer-agent/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/code_explain"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src/code_explain", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

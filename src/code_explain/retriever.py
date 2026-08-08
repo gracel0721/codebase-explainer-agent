@@ -48,11 +48,28 @@ class Retriever:
         hits = self.store.search(qvec, top_k=self.cfg.top_k)
         if not hits:
             return []
-        chunks = self.store.get_chunks([h.chunk_id for h in hits])
+
+        # Hybrid search: fuse vector hits with FTS5 BM25 hits via reciprocal
+        # rank fusion. Only when the store supports FTS and hybrid is on; a
+        # LanceDB backend (no search_fts) degrades to vector-only.
+        if self.cfg.hybrid_search and hasattr(self.store, "search_fts"):
+            fts_hits = self.store.search_fts(query, self.cfg.top_k)
+            fused_ids = self._fuse(hits, fts_hits)
+            chunks = self.store.get_chunks(fused_ids)
+        else:
+            chunks = self.store.get_chunks([h.chunk_id for h in hits])
         # ``store.search`` returns hits best-first (lowest cosine distance first),
         # and ``get_chunks`` preserves the requested order.
 
+        # Optional LLM rerank of the seed vector hits (before per-file cap and
+        # graph expansion, so graph interleaving is preserved). Zero overhead
+        # when ``reranker_model`` is unset.
+        if self.cfg.reranker_model:
+            chunks = self._rerank(query, chunks)
+
         chunks = self._apply_per_file_cap(chunks)
+        if self.cfg.with_graph:
+            chunks = self._expand_via_graph(chunks)
         chunks = self._maybe_add_file_headers(chunks)
         budget = self._context_budget(history or [])
         packed = self._pack_budget(chunks, budget)
@@ -73,6 +90,84 @@ class Retriever:
         kept_set = {id(c) for c in kept}
         leftover = [c for c in chunks if id(c) not in kept_set]
         return kept + leftover
+
+    def _rerank(self, query: str, chunks: list[Chunk]) -> list[Chunk]:
+        """Lazy-build and apply the configured reranker. Falls back to the
+        original order on any error (see :class:`OllamaReranker`)."""
+        if not hasattr(self, "_reranker"):
+            from code_explain.llm import LLMClient
+            from code_explain.reranker import OllamaReranker
+
+            self._reranker = OllamaReranker(self.cfg, LLMClient(self.cfg))
+        return self._reranker.rerank(query, chunks)
+
+    @staticmethod
+    def _fuse(hits, fts_hits) -> list[str]:
+        """Reciprocal rank fusion of vector + FTS hits -> ordered chunk_ids.
+
+        ``score = 1/(60+rank_vec) + 1/(60+rank_fts)``; the 60 constant is the
+        standard RRF damping. Each list is best-first; a chunk appearing in both
+        gets both contributions. Returns chunk_ids sorted by fused score desc.
+        """
+        scores: dict[str, float] = {}
+        for rank, h in enumerate(hits):
+            scores[h.chunk_id] = scores.get(h.chunk_id, 0.0) + 1.0 / (60 + rank)
+        for rank, (cid, _score) in enumerate(fts_hits):
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (60 + rank)
+        return [cid for cid, _ in sorted(scores.items(), key=lambda kv: -kv[1])]
+
+    # -- graph expansion (Stage 2) --------------------------------------
+
+    def _expand_via_graph(self, chunks: list[Chunk]) -> list[Chunk]:
+        """Pull graph neighbors (callers/callees/contained) of retrieved chunks
+        into context. No-op unless ``cfg.with_graph`` and a graph is present.
+
+        Expanded chunks are interleaved right after the seed that produced them,
+        so a call chain reads in order. They then flow through the normal token
+        budget packing; ``cap_per_seed`` / ``graph_depth`` bound the cost.
+        """
+        from code_explain import graph
+
+        conn = getattr(self.store, "_conn", None)
+        if conn is None or not chunks:
+            return chunks
+        if not graph.is_graph_present(self.store):
+            return chunks
+        neighbor_map = graph.expand(
+            self.store,
+            [c.chunk_id for c in chunks],
+            depth=self.cfg.graph_depth,
+            cap_per_seed=3,
+        )
+        if not neighbor_map:
+            return chunks
+        # Flatten neighbor ids and fetch their chunks in one query.
+        all_ids: list[str] = []
+        for ids in neighbor_map.values():
+            all_ids.extend(ids)
+        by_id = {c.chunk_id: c for c in self.store.get_chunks(all_ids)}
+        return self._interleave_graph_chunks(chunks, neighbor_map, by_id)
+
+    def _interleave_graph_chunks(
+        self,
+        seeds: list[Chunk],
+        neighbor_map: dict[str, list[str]],
+        by_id: dict[str, Chunk],
+    ) -> list[Chunk]:
+        """Insert each seed's neighbor chunks immediately after the seed."""
+        result: list[Chunk] = []
+        have: set[str] = {c.chunk_id for c in seeds}
+        for seed in seeds:
+            result.append(seed)
+            for nid in neighbor_map.get(seed.chunk_id, []):
+                if nid in have:
+                    continue
+                chunk = by_id.get(nid)
+                if chunk is None:
+                    continue
+                result.append(chunk)
+                have.add(nid)
+        return result
 
     def _maybe_add_file_headers(self, chunks: list[Chunk]) -> list[Chunk]:
         if not self.cfg.with_file_headers:

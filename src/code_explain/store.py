@@ -29,6 +29,33 @@ from code_explain.chunker import Chunk
 SCHEMA_VERSION = "1"
 
 
+# Stage 2 graph tables. Additive and lazy (created via
+# ``SQLiteVecStore.ensure_graph_tables``, like ``chunk_vec``) — NOT part of
+# ``SCHEMA_SQL`` and do NOT bump ``SCHEMA_VERSION``. An older DB without them
+# simply means graph features no-op.
+GRAPH_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS edges (
+    source_chunk_id TEXT NOT NULL,
+    target_chunk_id TEXT NOT NULL,
+    edge_kind       TEXT NOT NULL,
+    via_symbol      TEXT,
+    created_at      REAL NOT NULL,
+    PRIMARY KEY(source_chunk_id, target_chunk_id, edge_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_chunk_id);
+CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_chunk_id);
+
+CREATE TABLE IF NOT EXISTS imports (
+    rel_path         TEXT NOT NULL,
+    symbol           TEXT NOT NULL,
+    alias            TEXT,
+    module_path      TEXT NOT NULL,
+    target_rel_path  TEXT,
+    PRIMARY KEY(rel_path, symbol, module_path)
+);
+"""
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_id      TEXT PRIMARY KEY,
@@ -207,6 +234,8 @@ class SQLiteVecStore:
         self._conn = _open_connection(self.db_path)
         self._conn.executescript(SCHEMA_SQL)
         self._ensure_vec_table()
+        self.ensure_fts_table()
+        self.backfill_fts()
         # Seed schema_version if absent.
         if self.get_meta("schema_version") is None:
             self.set_meta("schema_version", SCHEMA_VERSION)
@@ -222,6 +251,70 @@ class SQLiteVecStore:
                 f"chunk_id TEXT PRIMARY KEY, embedding FLOAT[{self.embed_dim}])"
             )
             self._conn.commit()
+
+    def ensure_graph_tables(self) -> None:
+        """Create the Stage 2 ``edges``/``imports`` tables if missing.
+
+        Additive and optional — calling this on a fresh DB does not affect
+        Stage 1 behavior. Graph code calls this before reading/writing edges.
+        """
+        self._conn.executescript(GRAPH_SCHEMA_SQL)
+        self._conn.commit()
+
+    def ensure_fts_table(self) -> None:
+        """Create the hybrid-search FTS5 table if missing.
+
+        A regular (content-bearing) FTS5 table over chunk text/symbol/path.
+        ``chunk_id`` is UNINDEXED (stored, not matched) so we can map hits back
+        to chunks and delete rows by id on re-index. Created lazily in
+        :meth:`open`; an older DB without it simply means FTS adds nothing until
+        a re-index populates it.
+        """
+        self._conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5("
+            "chunk_id UNINDEXED, text, symbol, rel_path)"
+        )
+        self._conn.commit()
+
+    def backfill_fts(self) -> None:
+        """Idempotently ensure every chunk has an FTS row.
+
+        Incremental re-indexing skips unchanged files (the fast mtime path), so
+        chunks inserted before the FTS table existed — or by an older version
+        that didn't write FTS — would otherwise be absent from hybrid search
+        even though they're in the vector index. This repairs the gap on open
+        so an upgraded/incremental index gets full FTS coverage without a
+        ``--force`` rebuild.
+        """
+        conn = self._conn
+        n_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        n_fts = conn.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+        if n_fts >= n_chunks:
+            return  # complete (or close enough; --force recovers rare drift)
+        conn.execute(
+            "INSERT INTO chunks_fts(chunk_id, text, symbol, rel_path) "
+            "SELECT chunk_id, text, symbol, rel_path FROM chunks "
+            "WHERE chunk_id NOT IN (SELECT chunk_id FROM chunks_fts)"
+        )
+        conn.commit()
+
+    def drop_all(self) -> None:
+        """Drop all stored data and recreate the (empty) vector + FTS tables.
+
+        Called by the indexer when the embedding model/dim changed or on
+        ``--force``. Operates via this method (not raw ``_conn`` access in the
+        indexer) so a non-SQLite backend can implement its own teardown.
+        """
+        conn = self._conn
+        conn.executescript(
+            "DELETE FROM chunks; DELETE FROM files; DELETE FROM meta; "
+            "DROP TABLE IF EXISTS chunk_vec; "
+            "DROP TABLE IF EXISTS chunks_fts; "
+            "DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS imports;"
+        )
+        conn.commit()
+        self._ensure_vec_table()  # recreate with the configured dim
+        self.ensure_fts_table()
 
     def stored_embed_dim(self) -> int | None:
         """The embedding dimension this store was created with, or None."""
@@ -273,6 +366,11 @@ class SQLiteVecStore:
                     "INSERT INTO chunk_vec(chunk_id, embedding) VALUES (?, ?)",
                     (chunk.chunk_id, sqlite_vec.serialize_float32(emb)),
                 )
+                conn.execute(
+                    "INSERT INTO chunks_fts(chunk_id, text, symbol, rel_path) "
+                    "VALUES (?, ?, ?, ?)",
+                    (chunk.chunk_id, chunk.text, chunk.symbol or "", chunk.rel_path),
+                )
             # Upsert the file provenance row.
             conn.execute(
                 "INSERT INTO files(rel_path, lang, file_hash, mtime, n_chunks, indexed_at) "
@@ -306,6 +404,7 @@ class SQLiteVecStore:
         if ids:
             placeholders = ",".join("?" * len(ids))
             conn.execute(f"DELETE FROM chunk_vec WHERE chunk_id IN ({placeholders})", ids)
+            conn.execute(f"DELETE FROM chunks_fts WHERE chunk_id IN ({placeholders})", ids)
         conn.execute("DELETE FROM chunks WHERE rel_path = ?", (rel_path,))
         conn.execute("DELETE FROM files WHERE rel_path = ?", (rel_path,))
 
@@ -342,6 +441,28 @@ class SQLiteVecStore:
             (qblob, top_k),
         ).fetchall()
         return [ChunkHit(chunk_id=r["chunk_id"], distance=float(r["distance"])) for r in rows]
+
+    def search_fts(self, query: str, top_k: int) -> list[tuple[str, float]]:
+        """Hybrid-search: BM25-ranked chunk_ids for ``query`` (best first).
+
+        Returns ``(chunk_id, bm25_score)`` tuples. The query is wrapped as a
+        quoted phrase so FTS5 operator characters don't break the match; any
+        ``OperationalError`` (malformed query, table absent) returns ``[]`` so
+        the retriever falls back to vector-only.
+        """
+        if not query.strip():
+            return []
+        # Escape double quotes and wrap as a phrase to dodge FTS5 syntax errors.
+        q = '"' + query.replace('"', '""') + '"'
+        try:
+            rows = self._conn.execute(
+                "SELECT chunk_id, bm25(chunks_fts) AS score FROM chunks_fts "
+                "WHERE chunks_fts MATCH ? ORDER BY score LIMIT ?",
+                (q, top_k),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [(r["chunk_id"], float(r["score"])) for r in rows]
 
     def get_chunk(self, chunk_id: str) -> Chunk | None:
         row = self._conn.execute(
@@ -382,6 +503,20 @@ class SQLiteVecStore:
 
     def count_files(self) -> int:
         return int(self._conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
+
+    def count_edges(self) -> int:
+        """Number of graph edges, or 0 if the ``edges`` table doesn't exist yet."""
+        try:
+            return int(self._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0])
+        except sqlite3.OperationalError:
+            return 0
+
+    def count_imports(self) -> int:
+        """Number of resolved/unresolved import rows, or 0 if absent."""
+        try:
+            return int(self._conn.execute("SELECT COUNT(*) FROM imports").fetchone()[0])
+        except sqlite3.OperationalError:
+            return 0
 
 
 def _chunk_params(chunk: Chunk, now: float) -> tuple:

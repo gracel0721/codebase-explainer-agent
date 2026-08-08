@@ -78,8 +78,19 @@ def _write_index_ignore(cfg: Config) -> None:
 
 
 def open_store(cfg: Config, *, force: bool = False) -> SQLiteVecStore:
-    """Open the store, forcing a rebuild if the embedding model/dim changed."""
-    store = SQLiteVecStore(cfg.db_path, embed_dim=cfg.embed_dim)
+    """Open the store, forcing a rebuild if the embedding model/dim changed.
+
+    Factory: returns a :class:`LanceDBStore` when ``cfg.vector_backend ==
+    "lancedb"`` (requires the ``lancedb`` extra), else the default
+    :class:`SQLiteVecStore`. Both implement the same surface; graph + hybrid
+    FTS features are SQLite-only and degrade to vector-only under LanceDB.
+    """
+    if cfg.vector_backend == "lancedb":
+        from code_explain.lancedb_store import LanceDBStore
+
+        store = LanceDBStore(cfg)  # type: ignore[assignment]
+    else:
+        store = SQLiteVecStore(cfg.db_path, embed_dim=cfg.embed_dim)
     store.open()
     stored_model = store.stored_embed_model()
     stored_dim = store.stored_embed_dim()
@@ -103,13 +114,8 @@ def open_store(cfg: Config, *, force: bool = False) -> SQLiteVecStore:
 
 
 def _drop_all(store: SQLiteVecStore) -> None:
-    conn = store._conn  # type: ignore[attr-defined]
-    conn.executescript(
-        "DELETE FROM chunks; DELETE FROM files; DELETE FROM meta; "
-        "DROP TABLE IF EXISTS chunk_vec;"
-    )
-    conn.commit()
-    store._ensure_vec_table()  # recreate with the configured dim
+    """Drop all stored data via the store's own ``drop_all`` (backend-agnostic)."""
+    store.drop_all()
 
 
 def index_repo(
@@ -187,6 +193,7 @@ def index_repo(
             # refresh chunk count lazily to avoid per-file queries
 
     report.n_chunks = store.count_chunks()
+    store.set_meta("last_index_at", str(time.time()))
     report.duration = time.time() - start
     return report, store
 

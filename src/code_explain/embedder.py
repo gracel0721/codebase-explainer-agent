@@ -36,11 +36,16 @@ class Embedder:
     def _embed_batch_raw(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        resp = self._client.embed(
-            model=self.model,
-            input=texts,
-            options={"num_ctx": self.num_ctx},
-        )
+        try:
+            resp = self._client.embed(
+                model=self.model,
+                input=texts,
+                options={"num_ctx": self.num_ctx},
+            )
+        except Exception as exc:
+            from code_explain.errors import raise_ollama_or_reraise
+
+            raise_ollama_or_reraise(exc, model=self.model, what="embed texts with Ollama")
         # ollama>=0.3 returns a dict-like response with "embeddings" (plural).
         embs = getattr(resp, "embeddings", None)
         if embs is None and isinstance(resp, dict):

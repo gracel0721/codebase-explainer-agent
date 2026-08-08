@@ -17,7 +17,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from code_explain.llm import LLMClient
-from code_explain.prompts import CONTEXT_HEADER_TEMPLATE, SYSTEM_PROMPT
+from code_explain.prompts import CONTEXT_HEADER_TEMPLATE, SYSTEM_PROMPT, SYSTEM_PROMPT_GRAPH
 from code_explain.retriever import Retriever
 
 if TYPE_CHECKING:
@@ -48,23 +48,54 @@ def answer_question_stream(
 ) -> str:
     """Retrieve context for ``query``, stream the answer, return the full text."""
     chunks = retriever.retrieve(query, history=history)
+    if not chunks:
+        # Surface an actionable hint instead of letting the LLM ramble about
+        # "no indexed context". An empty index vs. a miss get different advice.
+        if store.count_chunks() == 0:
+            console.print(
+                "[yellow]The index is empty.[/yellow] "
+                "Run `code-explain index <path>` to build it, then ask again."
+            )
+        else:
+            console.print(
+                "[yellow]No indexed chunks matched your question.[/yellow] "
+                "Try rephrasing, or run `code-explain index <path>` to refresh the index."
+            )
     context = Retriever.render_context(chunks)
     user_msg = _build_user_message(query, context)
     messages = history + [{"role": "user", "content": user_msg}]
+    system = SYSTEM_PROMPT_GRAPH if cfg.with_graph else SYSTEM_PROMPT
 
     full_parts: list[str] = []
-    if render_markdown:
-        with Live("", console=console, refresh_per_second=20, vertical_overflow="visible") as live:
-            buf = ""
-            for delta in llm.chat_stream(SYSTEM_PROMPT, messages):
-                buf += delta
+    interrupted = False
+    try:
+        if render_markdown:
+            with Live("", console=console, refresh_per_second=20, vertical_overflow="visible") as live:
+                buf = ""
+                for delta in llm.chat_stream(system, messages):
+                    buf += delta
+                    full_parts.append(delta)
+                    live.update(Markdown(buf))
+        else:
+            for delta in llm.chat_stream(system, messages):
                 full_parts.append(delta)
-                live.update(Markdown(buf))
-    else:
-        for delta in llm.chat_stream(SYSTEM_PROMPT, messages):
-            full_parts.append(delta)
-            console.print(delta, end="")
+                console.print(delta, end="")
+    except KeyboardInterrupt:
+        interrupted = True
+        # Flush whatever was buffered before the interrupt (markdown may have an
+        # unrendered tail; raw mode printed incrementally already).
+        if render_markdown and full_parts:
+            console.print(Markdown("".join(full_parts)))
+    except Exception as exc:
+        # A dropped connection mid-stream (e.g. httpx.ReadError) — flush the
+        # partial text we did receive rather than dropping it, then re-raise so
+        # the caller's Ollama-error handler can print a friendly message.
+        if full_parts and render_markdown:
+            console.print(Markdown("".join(full_parts)))
+        raise
     full = "".join(full_parts)
+    if interrupted:
+        console.print("\n[dim][interrupted][/dim]")
 
     # Show the citations actually used (path:line) under the answer.
     if chunks:
